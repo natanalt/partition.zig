@@ -58,6 +58,17 @@ pub const Guid = extern struct {
     }
 };
 
+pub const GptKind = enum { primary, backup };
+
+// TODO: add verifications for
+//  * no partition overlaps
+//  * no partitions going out of bounds
+//  * fields like first_usable_lba not overlapping primary/backup GPTs
+//
+// They aren't super necessary, but are just making the library more bulletproof
+// Ideally, every invalid case should be caught, no matter how small and impossible to find on normal systems.
+
+/// Representation of a GPT formatted disk
 pub const GptDisk = struct {
     pub const max_partitions = 128;
     pub const header_size = @sizeOf(raw.Header);
@@ -79,6 +90,8 @@ pub const GptDisk = struct {
     device: DeviceParam,
     disk_guid: Guid,
     partitions: [max_partitions]?GptPartition,
+    first_usable_lba: u64,
+    last_usable_lba: u64,
     placement: struct {
         primary_header_lba: u64,
         primary_table_lba: u64,
@@ -87,36 +100,51 @@ pub const GptDisk = struct {
         partition_entry_size: u64,
     },
 
-    /// Only used by GptDisk.read()
+    /// Modified by GptDisk.read() to signal anything that could've partially gone wrong during
+    /// the read.
     read_warnings: ReadWarnings = .{},
 
     pub fn new(device: DeviceParam) GptDisk {
+        const partition_table_sectors = std.math.divCeil(
+            u64, 
+            @sizeOf(raw.PartitionEntry) * max_partitions,
+            device.sector_size,
+        ) catch unreachable;
         return .{
             .device = device,
             .disk_guid = Guid.createRandom(),
             .partitions = [_]?GptPartition{null} ** max_partitions,
+            .first_usable_lba = 1 + 1 + partition_table_sectors,
+            .last_usable_lba = device.total_sectors - 1 - 1 - partition_table_sectors,
             .placement = .{
                 .primary_header_lba = 1,
                 .primary_table_lba = 2,
                 .backup_header_lba = device.total_sectors - 1,
-                .backup_table_lba = blk: {
-                    const partition_table_sectors = std.math.divCeil(
-                        u64, 
-                        @sizeOf(raw.PartitionEntry) * max_partitions,
-                        device.sector_size,
-                    ) catch unreachable;
-                    break :blk device.total_sectors - partition_table_sectors - 1;
-                },
+                .backup_table_lba = device.total_sectors - partition_table_sectors - 1,
                 .partition_entry_size = @sizeOf(raw.PartitionEntry),
             }
         };
     }
 
+    /// Attempts to read a GPT formatted disk
+    /// Returns error.NoGpt if no GPTs are found on the disk
+    /// Returns error.GptsNotEqual if primary and backup GPTs are valid, but not equal
+    /// May also return any error from the stream, device, and some other things
     pub fn read(
         allocator: *std.mem.Allocator,
         device: DeviceParam,
         stream: *std.io.StreamSource,
     ) !GptDisk {
+        // TODO: check for a protective MBR before parsing GPT stuff
+        // A present and valid GPT does not necessarily mean that the disk is actually meant to be
+        // a valid GPT disk. If a GPT device is reformatted to MBR, the partitioning software may
+        // not wipe the GPT structures, causing problems.
+        //
+        // The solution for that is to analyze the MBR at LBA 0.
+        // If the MBR is not valid, or contains a partition of type 0xEE (GPT protective), then
+        // this disk may be considered a potentially valid GPT disk. Any other MBR present suggests
+        // that this device is actually MBR formatted and GPT operations should not be preformed
+        // on it.
 
         // Arena used for temporary parsing allocations
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -130,9 +158,13 @@ pub const GptDisk = struct {
             device, 
             stream, 
             1,
-        ) catch blk: {
-            read_warnings.primary_gpt_corrupt = true;
-            break :blk null;
+        ) catch |e| blk: {
+            if (e == error.InvalidGpt) {
+                read_warnings.primary_gpt_corrupt = true;
+                break :blk null;
+            } else {
+                return e;
+            }
         };
         
         const backup_lba = if (primary_gpt_opt) |gpt|
@@ -145,9 +177,13 @@ pub const GptDisk = struct {
             device, 
             stream, 
             backup_lba,
-        ) catch blk: {
-            read_warnings.backup_gpt_corrupt = true;
-            break :blk null;
+        ) catch |e| blk: {
+            if (e == error.InvalidGpt) {
+                read_warnings.backup_gpt_corrupt = true;
+                break :blk null;
+            } else {
+                return e;
+            }
         };
 
         if (read_warnings.primary_gpt_corrupt and read_warnings.backup_gpt_corrupt)
@@ -186,7 +222,7 @@ pub const GptDisk = struct {
                     .starting_lba = raw_entry.starting_lba,
                     .ending_lba = raw_entry.ending_lba,
                     .attributes = try GptPartition.Attributes.unpack(raw_entry.attributes),
-                    .name = try std.unicode.utf16leToUtf8Alloc(allocator, for (raw_entry.partition_name) |v, j| {
+                    .name = try ucs2ToUtf8Alloc(allocator, for (raw_entry.partition_name) |v, j| {
                         if (v == 0)
                             break raw_entry.partition_name[0..j];
                     } else &raw_entry.partition_name),
@@ -197,6 +233,7 @@ pub const GptDisk = struct {
         return result;
     }
 
+    /// Verifies whether provided device is a valid GPT device
     pub fn isValidGpt(
         allocator: *std.mem.Allocator,
         device: DeviceParam,
@@ -217,12 +254,87 @@ pub const GptDisk = struct {
         return true;
     }
 
-    pub fn write(self: GptDisk, stream: *std.io.StreamSource) !void {
-        const writer = stream.writer();
-        const seekable = stream.seekableStream();
-        @compileError("nya uwu");
+    /// Writes this GPT structure onto the target stream.
+    /// This will overwrite any already present GPT and MBR structures
+    /// Takes a temporary allocator, any memory allocated by it will be freed after this function
+    /// returns.
+    pub fn write(
+        allocator: *std.mem.Allocator,
+        self: GptDisk,
+        stream: *std.io.StreamSource
+    ) !void {
+        var pea_stream = std.io.FixedBufferStream([]u8){
+            .pos = 0,
+            .buffer = try allocator.alloc(u8, self.device.sectorAlignSize(
+                self.partitions.len * self.placement.partition_entry_size,
+            )),
+        };
+        defer allocator.free(pea_stream.buffer);
+
+        // Note: hardcoded minimal part entry size
+        if (self.placement.partition_entry_size < 128)
+            return error.PartitionEntrySizeTooSmall;
+
+        for (self.partitions) |part_opt| {
+            if (part_opt) |part| {
+                const raw_entry = raw.PartitionEntry{
+                    .partition_type_guid = part.partition_type.data,
+                    .unique_partition_guid = part.partition_guid.data,
+                    .starting_lba = part.starting_lba,
+                    .ending_lba = part.ending_lba,
+                    .attributes = part.attributes.pack(),
+                    .partition_name = blk: {
+                        var result = [_]u16{0} ** 36;
+                        _ = try utf8ToUcs2Le(part.name, result[0..35]);
+                        break :blk result;
+                    },
+                };
+            } else {
+                try pea_stream.writer().writeByteNTimes(0, self.device.sector_size);
+            }
+        }
+
+        // TODO: write a protective MBR instead of overwriting it with 0s
+        try stream.seekTo(try self.device.lbaToOffset(0));
+        try stream.writer().writeByteNTimes(0, self.device.sector_size);
     }
 
+    fn writeHeader(
+        self: GptDisk,
+        stream: *std.io.StreamSource,
+        kind: GptKind,
+        part_table_crc: u32,
+    ) !void {
+        var header = raw.Header{
+            .signature = raw.Header.valid_signature,
+            .revision = raw.Header.valid_revision,
+            .header_size = 92, // Note: hardcoding this because of some weird size issues with raw.Header
+            .header_crc32 = 0,
+            .reserved = 0,
+            .my_lba = switch (kind) {
+                .primary => self.placement.primary_header_lba,
+                .backup => self.placement.backup_header_lba,
+            },
+            .alternate_lba = switch (kind) {
+                .primary => self.placement.backup_header_lba,
+                .backup => self.placement.primary_header_lba,
+            },
+            .first_usable_lba = self.first_usable_lba,
+            .last_usable_lba = self.last_usable_lba,
+            .disk_guid = self.disk_guid.data,
+            .partition_entry_lba = switch (kind) {
+                .primary => self.placement.primary_table_lba,
+                .backup => self.placement.backup_table_lba,
+            },
+            .number_of_partition_entries = self.partitions.len,
+            .size_of_partition_entry = self.placement.partition_entry_size,
+            .partition_entry_array_crc32 = part_table_crc,
+        };
+        header.header_crc32 = Crc32.hash(raw.toBytes(raw.Header, header)[0..header.header_size]);
+
+        try stream.seekTo(try self.device.lbaToOffset(header.my_lba));
+        try stream.writer().writeAll(raw.toBytes(raw.Header, header)[0..]);
+    }
 };
 
 pub const GptPartition = struct {
@@ -270,6 +382,8 @@ pub const GptPartition = struct {
 };
 
 pub const raw = struct {
+
+    /// Raw GPT header, per UEFI specification
     pub const Header = extern struct {
         pub const valid_signature = [8]u8{ 'E', 'F', 'I', ' ', 'P', 'A', 'R', 'T' };
         pub const valid_revision = [4]u8{ 0, 0, 1, 0 };
@@ -290,6 +404,9 @@ pub const raw = struct {
         partition_entry_array_crc32: u32,
     };
 
+    /// Raw partition entry, per UEFI specification
+    /// Note: according to some sources (like OSDev Wiki), size of partition_name should not be
+    /// hardcoded. So this behavior may need to be adjusted as needed.
     pub const PartitionEntry = extern struct {
         partition_type_guid: [16]u8,
         unique_partition_guid: [16]u8,
@@ -315,27 +432,6 @@ pub const raw = struct {
         var copy = value;
         byteSwapAllIntegersOnBigEndian(T, &copy);
         return std.mem.toBytes(copy);
-    }
-
-    pub fn fromReader(
-        comptime T: type,
-        reader: anytype
-    ) !T {
-        var bytes: [@sizeOf(T)]u8 = undefined;
-        const n = try reader.read(&bytes);
-        if (n != bytes.len) {
-            return error.UnexpectedEof;
-        }
-        return fromBytes(T, &bytes);
-    }
-
-    pub fn toWriter(
-        comptime T: type,
-        value: T,
-        writer: anytype,
-    ) !void {
-        const bytes = toBytes(T, value);
-        try writer.writeAll(&bytes);
     }
 
     fn byteSwapAllIntegersOnBigEndian(
@@ -366,12 +462,15 @@ const RawGpt = struct {
     raw_header: []u8,
     raw_pea: []u8,
 
+    /// Reads a GPT, starting at the header at provided LBA.
+    /// Returns a RawGpt on success, error.InvalidGpt if any of the verifications fail, or any
+    /// other error if an allocation/seek/read failure occurs.
     pub fn read(
         allocator: *std.mem.Allocator,
         device: DeviceParam,
         stream: *std.io.StreamSource,
         header_lba: u64,
-    ) !RawGpt {
+    ) !Self {
         var self = Self{
             .raw_header = undefined,
             .raw_pea = undefined,
@@ -384,13 +483,13 @@ const RawGpt = struct {
         
         const header = self.getHeader();
         if (!std.mem.eql(u8, &header.signature, &raw.Header.valid_signature))
-            return error.InvalidSignature;
+            return error.InvalidGpt;
         if (header.header_crc32 != self.getHeaderCrc())
-            return error.InvalidHeaderCrc32;
+            return error.InvalidGpt;
         if (!std.mem.eql(u8, &header.revision, &raw.Header.valid_revision))
-            return error.InvalidRevision;
+            return error.InvalidGpt;
         if (header.my_lba != header_lba)
-            return error.InvalidMyLba;
+            return error.InvalidGpt;
         
         const pea_size = header.size_of_partition_entry * header.number_of_partition_entries;
         self.raw_pea = try allocator.alloc(u8, pea_size);
@@ -399,15 +498,17 @@ const RawGpt = struct {
         try readFullOrError(stream.reader(), self.raw_pea);
 
         if (header.partition_entry_array_crc32 != std.hash.Crc32.hash(self.raw_pea))
-            return error.InvalidTableCrc32;
+            return error.InvalidGpt;
 
         return self;
     }
 
+    /// Extracts the header from the raw header sector
     pub fn getHeader(self: Self) raw.Header {
         return raw.fromBytes(raw.Header, self.raw_header[0..@sizeOf(raw.Header)]);
     }
 
+    /// Calculates a CRC32 hash of the header
     pub fn getHeaderCrc(self: Self) u32 {
         const header = std.mem.bytesAsValue(raw.Header, self.raw_header[0..@sizeOf(raw.Header)]);
         const old_crc = header.header_crc32;
@@ -417,6 +518,7 @@ const RawGpt = struct {
         return hash;
     }
 
+    /// Extracts a specified partition entry from the raw partition table buffer
     pub fn getPartitionEntry(self: Self, idx: u32) raw.PartitionEntry {
         const header = self.getHeader();
         if (idx >= header.number_of_partition_entries) {
@@ -429,6 +531,10 @@ const RawGpt = struct {
         );
     }
 
+    /// Checks if both GPTs are effectively equal.
+    /// Assumes that both GPTs are valid (including their hashes).
+    /// This function is used in the parsing process, to verify that both primary and backup GPTs
+    /// refer to the same values and each other.
     pub fn areGptsEqual(self: Self, other: Self) bool {
         const a = self.getHeader();
         const b = other.getHeader();
@@ -455,6 +561,8 @@ const RawGpt = struct {
     }
 };
 
+/// Reads data from given reader into specified buffer. If amount of read data doesn't equal the
+/// buffer's size, error.UnexpectedEof is returned.
 fn readFullOrError(
     reader: anytype,
     buf: []u8,
@@ -462,4 +570,44 @@ fn readFullOrError(
     const n = try reader.read(buf);
     if (n != buf.len)
         return error.UnexpectedEof;
+}
+
+fn ucs2LeToUtf8Alloc(
+    allocator: *std.mem.Allocator,
+    string: []const u16,
+) ![]u8 {
+    var list = std.ArrayList(u8).init(allocator);
+    errdefer list.deinit();
+    for (string) |c| {
+        var next = [_]u8{0} ** 4;
+        const len = try std.unicode.utf8Encode(switch (native_endian) {
+            .Little => c,
+            .Big => @byteSwap(u16, c),
+        }, &next);
+        try list.appendSlice(next[0..len]);
+    }
+    return list.toOwnedSlice();
+}
+
+/// May return error.OutputTooSmall or error.InvalidCodePoint (if any codepoint is >0xFFFF)
+/// Returns first unused index or in other words length of converted memory in u16 words
+fn utf8ToUcs2Le(
+    in: []const u8,
+    out: []u16,
+) !usize {
+    var i: usize = 0;
+    var it = std.unicode.Utf8Iterator{ .bytes = in, .i = 0 };
+    while (it.nextCodepoint()) |cp| : (i += 1) {
+        if (cp > 0xFFFF)
+            return error.InvalidCodePoint;
+        if (i >= out.len) {
+            return error.OutputTooSmall;
+        } else {
+            out[i] = switch (native_endian) {
+                .Little => cp,
+                .Big => @byteSwap(u16, cp),
+            };
+        }
+    }
+    return i;
 }

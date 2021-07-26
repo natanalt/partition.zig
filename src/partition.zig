@@ -27,6 +27,10 @@ pub const DeviceParam = struct {
         else
             error.OutOfBounds;
     }
+
+    pub fn sectorAlignSize(self: DeviceParam, size: u64) u64 {
+        return std.mem.alignForwardGeneric(u64, size, self.sector_size);
+    }
 };
 
 pub const PartitionTableKind = enum {
@@ -47,4 +51,8 @@ pub fn readPartitionTable(
     if (gpt_disk) |gd| return PartitionTable{ .gpt = gd };
 
     return null;
+}
+
+test {
+
 }
