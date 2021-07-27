@@ -97,7 +97,7 @@ pub const GptDisk = struct {
         primary_table_lba: u64,
         backup_header_lba: u64,
         backup_table_lba: u64,
-        partition_entry_size: u64,
+        partition_entry_size: u32,
     },
 
     /// Modified by GptDisk.read() to signal anything that could've partially gone wrong during
@@ -145,6 +145,9 @@ pub const GptDisk = struct {
         // this disk may be considered a potentially valid GPT disk. Any other MBR present suggests
         // that this device is actually MBR formatted and GPT operations should not be preformed
         // on it.
+        //
+        // It's also needed by util-linux's fdisk to consider a GPT disk as valid
+        // 
 
         // Arena used for temporary parsing allocations
         var arena = std.heap.ArenaAllocator.init(allocator);
@@ -259,10 +262,14 @@ pub const GptDisk = struct {
     /// Takes a temporary allocator, any memory allocated by it will be freed after this function
     /// returns.
     pub fn write(
-        allocator: *std.mem.Allocator,
         self: GptDisk,
-        stream: *std.io.StreamSource
+        allocator: *std.mem.Allocator,
+        stream: *std.io.StreamSource,
     ) !void {
+
+        // TODO: get rid of the allocator by writing the partition table directly into the target
+        //       device, calculating its CRC on the fly
+
         var pea_stream = std.io.FixedBufferStream([]u8){
             .pos = 0,
             .buffer = try allocator.alloc(u8, self.device.sectorAlignSize(
@@ -275,6 +282,7 @@ pub const GptDisk = struct {
         if (self.placement.partition_entry_size < 128)
             return error.PartitionEntrySizeTooSmall;
 
+        // Write the partition table into a temporary buffer (allocated above)
         for (self.partitions) |part_opt| {
             if (part_opt) |part| {
                 const raw_entry = raw.PartitionEntry{
@@ -289,20 +297,34 @@ pub const GptDisk = struct {
                         break :blk result;
                     },
                 };
+                // Technically those aren't "sectors", but use case is the same
+                try writeSectorsPadWithZeros(
+                    pea_stream.writer(),
+                    raw.toBytes(raw.PartitionEntry, raw_entry)[0..std.math.min(
+                        self.placement.partition_entry_size,
+                        @sizeOf(raw.PartitionEntry),
+                    )],
+                    self.placement.partition_entry_size,
+                );
             } else {
-                try pea_stream.writer().writeByteNTimes(0, self.device.sector_size);
+                try pea_stream.writer().writeByteNTimes(0, self.placement.partition_entry_size);
             }
         }
 
         // TODO: write a protective MBR instead of overwriting it with 0s
         try stream.seekTo(try self.device.lbaToOffset(0));
         try stream.writer().writeByteNTimes(0, self.device.sector_size);
+
+        const pea_hash = Crc32.hash(pea_stream.buffer);
+        try self.writeGpt(stream, .primary, pea_stream.buffer, pea_hash);
+        try self.writeGpt(stream, .backup, pea_stream.buffer, pea_hash);
     }
 
-    fn writeHeader(
+    fn writeGpt(
         self: GptDisk,
         stream: *std.io.StreamSource,
         kind: GptKind,
+        part_table: []const u8,
         part_table_crc: u32,
     ) !void {
         var header = raw.Header{
@@ -333,22 +355,36 @@ pub const GptDisk = struct {
         header.header_crc32 = Crc32.hash(raw.toBytes(raw.Header, header)[0..header.header_size]);
 
         try stream.seekTo(try self.device.lbaToOffset(header.my_lba));
-        try stream.writer().writeAll(raw.toBytes(raw.Header, header)[0..]);
+        try writeSectorsPadWithZeros(
+            stream.writer(),
+            raw.toBytes(raw.Header, header)[0..header.header_size],
+            self.device.sector_size,
+        );
+
+        try stream.seekTo(try self.device.lbaToOffset(header.partition_entry_lba));
+        try writeSectorsPadWithZeros(
+            stream.writer(), 
+            part_table, 
+            self.device.sector_size,
+        );
     }
 };
 
+/// Representation of a GPT partition.
+/// Note, that the name stored in here is meant to be UTF-8 and is validated and covnerted to UCS-2
+/// when GPT is written to a target device.
 pub const GptPartition = struct {
     pub const Attributes = struct {
-        required_by_system: bool,
-        no_block_io: bool,
-        legacy_boot: bool,
-        fs_reserved: u16,
+        required_by_system: bool = false,
+        no_block_io: bool = false,
+        legacy_boot: bool = false,
+        fs_reserved: u16 = 0,
 
         pub fn pack(self: Attributes) u64 {
             var result: u64 = 0;
-            result |= if (self.required_by_system) 1 << 0 else 0;
-            result |= if (self.no_block_io) 1 << 1 else 0;
-            result |= if (self.legacy_boot) 1 << 2 else 0;
+            result |= if (self.required_by_system) @as(u64, 1) << 0 else 0;
+            result |= if (self.no_block_io) @as(u64, 1) << 1 else 0;
+            result |= if (self.legacy_boot) @as(u64, 1) << 2 else 0;
             result |= @intCast(u64, self.fs_reserved) << 48;
             return result;
         }
@@ -572,6 +608,21 @@ fn readFullOrError(
         return error.UnexpectedEof;
 }
 
+/// Writes a specified buffer, and pads it with zeroes based on specified alignment/sector_size
+fn writeSectorsPadWithZeros(
+    writer: anytype,
+    buffer: []const u8,
+    sector_size: u64,
+) !void {
+    try writer.writeAll(buffer);
+    if ((buffer.len % sector_size) != 0) {
+        const pad_size = sector_size - (buffer.len % sector_size);
+        try writer.writeByteNTimes(0, pad_size);
+    }
+}
+
+/// Converts a UCS2 string (made of simple u16 Unicode codepoints), with each u16 encoded in little
+/// endian, into an allocated UTF-8 string
 fn ucs2LeToUtf8Alloc(
     allocator: *std.mem.Allocator,
     string: []const u16,
@@ -580,10 +631,7 @@ fn ucs2LeToUtf8Alloc(
     errdefer list.deinit();
     for (string) |c| {
         var next = [_]u8{0} ** 4;
-        const len = try std.unicode.utf8Encode(switch (native_endian) {
-            .Little => c,
-            .Big => @byteSwap(u16, c),
-        }, &next);
+        const len = try std.unicode.utf8Encode(std.mem.littleToNative(u16, c), &next);
         try list.appendSlice(next[0..len]);
     }
     return list.toOwnedSlice();
@@ -603,10 +651,7 @@ fn utf8ToUcs2Le(
         if (i >= out.len) {
             return error.OutputTooSmall;
         } else {
-            out[i] = switch (native_endian) {
-                .Little => cp,
-                .Big => @byteSwap(u16, cp),
-            };
+            out[i] = std.mem.nativeToLittle(u16, @intCast(u16, cp));
         }
     }
     return i;

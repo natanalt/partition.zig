@@ -44,9 +44,9 @@ pub const PartitionTable = union(PartitionTableKind) {
 pub fn readPartitionTable(
     allocator: *std.mem.Allocator,
     device: DeviceParam,
-    source: *std.io.StreamSource,
+    stream: *std.io.StreamSource,
 ) !?PartitionTable {
-
+    
     const gpt_disk: ?gpt.Disk = gpt.GptDisk.read(allocator, device, stream) catch null;
     if (gpt_disk) |gd| return PartitionTable{ .gpt = gd };
 
