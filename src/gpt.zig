@@ -1,8 +1,9 @@
 const std = @import("std");
+const utils = @import("utils.zig");
 const partition = @import("partition.zig");
 const DeviceParam = partition.DeviceParam;
-
 const Crc32 = std.hash.Crc32;
+
 const native_endian: std.builtin.Endian = std.Target.current.cpu.arch.endian();
 
 pub const Guid = extern struct {
@@ -298,7 +299,7 @@ pub const GptDisk = struct {
                     },
                 };
                 // Technically those aren't "sectors", but use case is the same
-                try writeSectorsPadWithZeros(
+                try utils.writeSectorsPadWithZeros(
                     pea_stream.writer(),
                     raw.toBytes(raw.PartitionEntry, raw_entry)[0..std.math.min(
                         self.placement.partition_entry_size,
@@ -311,9 +312,28 @@ pub const GptDisk = struct {
             }
         }
 
-        // TODO: write a protective MBR instead of overwriting it with 0s
+        // TODO: write a protective MBR instead of faking it
         try stream.seekTo(try self.device.lbaToOffset(0));
-        try stream.writer().writeByteNTimes(0, self.device.sector_size);
+        try stream.writer().writeByteNTimes(0, 446);
+        try stream.writer().writeAll(&[_]u8{
+            0x00,
+            0x00, 0x02, 0x00,
+            0xEE,
+            0xFF, 0xFF, 0xFF,
+            0x01, 0x00, 0x00, 0x00,
+        });
+        // write last LBA
+        try stream.writer().writeIntLittle(
+            u32,
+            if (self.device.total_sectors > 0xFFFF_FFFF)
+                0xFFFFFFFF
+            else
+                @intCast(u32, self.device.total_sectors - 1)
+        );
+        try stream.writer().writeByteNTimes(0, 48);
+        try stream.writer().writeByte(0x55);
+        try stream.writer().writeByte(0xAA);
+        // MBR fake end
 
         const pea_hash = Crc32.hash(pea_stream.buffer);
         try self.writeGpt(stream, .primary, pea_stream.buffer, pea_hash);
@@ -355,14 +375,14 @@ pub const GptDisk = struct {
         header.header_crc32 = Crc32.hash(raw.toBytes(raw.Header, header)[0..header.header_size]);
 
         try stream.seekTo(try self.device.lbaToOffset(header.my_lba));
-        try writeSectorsPadWithZeros(
+        try utils.writeSectorsPadWithZeros(
             stream.writer(),
             raw.toBytes(raw.Header, header)[0..header.header_size],
             self.device.sector_size,
         );
 
         try stream.seekTo(try self.device.lbaToOffset(header.partition_entry_lba));
-        try writeSectorsPadWithZeros(
+        try utils.writeSectorsPadWithZeros(
             stream.writer(), 
             part_table, 
             self.device.sector_size,
@@ -408,19 +428,12 @@ pub const GptPartition = struct {
     starting_lba: u64,
     ending_lba: u64,
     attributes: Attributes,
-
-    pub fn isNameValid(self: GptPartition) bool {
-        var buffer: [512]u8 = undefined;
-        var fba = std.heap.FixedBufferAllocator.init(&buffer);
-        const str = std.unicode.utf8ToUtf16LeWithNull(&fba.allocator, self.name) catch return false;
-        return str.len <= 35;
-    }
 };
 
 pub const raw = struct {
 
     /// Raw GPT header, per UEFI specification
-    pub const Header = extern struct {
+    pub const Header = packed struct {
         pub const valid_signature = [8]u8{ 'E', 'F', 'I', ' ', 'P', 'A', 'R', 'T' };
         pub const valid_revision = [4]u8{ 0, 0, 1, 0 };
 
@@ -443,7 +456,7 @@ pub const raw = struct {
     /// Raw partition entry, per UEFI specification
     /// Note: according to some sources (like OSDev Wiki), size of partition_name should not be
     /// hardcoded. So this behavior may need to be adjusted as needed.
-    pub const PartitionEntry = extern struct {
+    pub const PartitionEntry = packed struct {
         partition_type_guid: [16]u8,
         unique_partition_guid: [16]u8,
         starting_lba: u64,
@@ -606,19 +619,6 @@ fn readFullOrError(
     const n = try reader.read(buf);
     if (n != buf.len)
         return error.UnexpectedEof;
-}
-
-/// Writes a specified buffer, and pads it with zeroes based on specified alignment/sector_size
-fn writeSectorsPadWithZeros(
-    writer: anytype,
-    buffer: []const u8,
-    sector_size: u64,
-) !void {
-    try writer.writeAll(buffer);
-    if ((buffer.len % sector_size) != 0) {
-        const pad_size = sector_size - (buffer.len % sector_size);
-        try writer.writeByteNTimes(0, pad_size);
-    }
 }
 
 /// Converts a UCS2 string (made of simple u16 Unicode codepoints), with each u16 encoded in little
