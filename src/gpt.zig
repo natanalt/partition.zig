@@ -40,11 +40,10 @@ pub const Guid = extern struct {
         _ = fmt;
         _ = options;
 
-        // Format: {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}
+        // Format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
         //  * first 3 sequences are little endian
         //  * last 2 sequences are big endian
         //  * apparently?????
-        try writer.print("{{", .{});
         comptime var i = 0;
         inline while (i < 4) : (i += 1) try writer.print("{X:0>2}", .{self.data[3 - i]});
         try writer.print("-", .{});
@@ -55,7 +54,6 @@ pub const Guid = extern struct {
         inline while (i < 10) : (i += 1) try writer.print("{X:0>2}", .{self.data[i]});
         try writer.print("-", .{});
         inline while (i < 16) : (i += 1) try writer.print("{X:0>2}", .{self.data[i]});
-        try writer.print("}}", .{});
     }
 };
 
@@ -226,7 +224,7 @@ pub const GptDisk = struct {
                     .starting_lba = raw_entry.starting_lba,
                     .ending_lba = raw_entry.ending_lba,
                     .attributes = try GptPartition.Attributes.unpack(raw_entry.attributes),
-                    .name = try ucs2ToUtf8Alloc(allocator, for (raw_entry.partition_name) |v, j| {
+                    .name = try ucs2LeToUtf8Alloc(allocator, for (raw_entry.partition_name) |v, j| {
                         if (v == 0)
                             break raw_entry.partition_name[0..j];
                     } else &raw_entry.partition_name),
@@ -433,7 +431,7 @@ pub const GptPartition = struct {
 pub const raw = struct {
 
     /// Raw GPT header, per UEFI specification
-    pub const Header = packed struct {
+    pub const Header = extern struct {
         pub const valid_signature = [8]u8{ 'E', 'F', 'I', ' ', 'P', 'A', 'R', 'T' };
         pub const valid_revision = [4]u8{ 0, 0, 1, 0 };
 
@@ -456,7 +454,7 @@ pub const raw = struct {
     /// Raw partition entry, per UEFI specification
     /// Note: according to some sources (like OSDev Wiki), size of partition_name should not be
     /// hardcoded. So this behavior may need to be adjusted as needed.
-    pub const PartitionEntry = packed struct {
+    pub const PartitionEntry = extern struct {
         partition_type_guid: [16]u8,
         unique_partition_guid: [16]u8,
         starting_lba: u64,

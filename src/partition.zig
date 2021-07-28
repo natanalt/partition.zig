@@ -2,7 +2,7 @@
 //! partition.zig is a partitioning library for Zig. It provides implementations
 //! of various partition tables and lets you read, create and modify them.
 //!
-//! Written by Natalia Cholewa
+//! by Natalia Cholewa
 //! Project repository: https://github.com/natanalt/partition.zig
 //! Version: 0.1.0
 //!
@@ -46,13 +46,24 @@ pub fn readPartitionTable(
     device: DeviceParam,
     stream: *std.io.StreamSource,
 ) !?PartitionTable {
-    
+
     const gpt_disk: ?gpt.Disk = gpt.GptDisk.read(allocator, device, stream) catch null;
     if (gpt_disk) |gd| return PartitionTable{ .gpt = gd };
 
     return null;
 }
 
-test {
+pub fn checkPartitionTable(
+    allocator: *std.mem.Allocator,
+    device: DeviceParam,
+    stream: *std.io.StreamSource,
+) !?PartitionTableKind {
+    return if (try gpt.GptDisk.isValidGpt(allocator, device, stream))
+        .gpt
+    else
+        null;
+}
 
+test {
+    std.testing.refAllDecls(@This());
 }
