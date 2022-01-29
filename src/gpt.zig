@@ -1,10 +1,11 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const utils = @import("utils.zig");
 const partition = @import("partition.zig");
 const DeviceParam = partition.DeviceParam;
 const Crc32 = std.hash.Crc32;
 
-const native_endian: std.builtin.Endian = std.Target.current.cpu.arch.endian();
+const native_endian: std.builtin.Endian = builtin.target.cpu.arch.endian();
 
 pub const Guid = extern struct {
     /// Raw byte data of the GUID
@@ -77,8 +78,8 @@ pub const GptDisk = struct {
         backup_gpt_corrupt: bool = false,
 
         pub fn isEverythingOk(self: ReadWarnings) bool {
-            inline for (std.meta.fields(T)) |f| {
-                if (!@field(self, f.name)) {
+            inline for (std.meta.fields(ReadWarnings)) |f| {
+                if (@field(self, f.name)) {
                     return false;
                 }
             }
@@ -125,12 +126,22 @@ pub const GptDisk = struct {
         };
     }
 
+    /// Deallocates all strings allocated by this GPT, assuming that everything used the passed
+    /// allocator.
+    pub fn deinit(self: *const GptDisk, allocator: std.mem.Allocator) void {
+        for (self.partitions) |part_opt| {
+            if (part_opt) |part| {
+                allocator.free(part.name);
+            }
+        }
+    }
+
     /// Attempts to read a GPT formatted disk
     /// Returns error.NoGpt if no GPTs are found on the disk
     /// Returns error.GptsNotEqual if primary and backup GPTs are valid, but not equal
     /// May also return any error from the stream, device, and some other things
     pub fn read(
-        allocator: *std.mem.Allocator,
+        allocator: std.mem.Allocator,
         device: DeviceParam,
         stream: *std.io.StreamSource,
     ) !GptDisk {
@@ -151,7 +162,7 @@ pub const GptDisk = struct {
         // Arena used for temporary parsing allocations
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
-        const temp_allocator = &arena.allocator;
+        const temp_allocator = arena.allocator();
 
         var read_warnings = ReadWarnings{};
         
@@ -202,6 +213,8 @@ pub const GptDisk = struct {
         const source_header = source_gpt.getHeader();
         
         var result = GptDisk.new(device);
+        result.first_usable_lba = source_header.first_usable_lba;
+        result.last_usable_lba = source_header.last_usable_lba;
         result.read_warnings = read_warnings;
         result.disk_guid = Guid.fromBytes(&source_header.disk_guid);
         result.placement.partition_entry_size = source_header.size_of_partition_entry;
@@ -237,7 +250,7 @@ pub const GptDisk = struct {
 
     /// Verifies whether provided device is a valid GPT device
     pub fn isValidGpt(
-        allocator: *std.mem.Allocator,
+        allocator: std.mem.Allocator,
         device: DeviceParam,
         stream: *std.io.StreamSource,
     ) !bool {
@@ -262,7 +275,7 @@ pub const GptDisk = struct {
     /// returns.
     pub fn write(
         self: GptDisk,
-        allocator: *std.mem.Allocator,
+        allocator: std.mem.Allocator,
         stream: *std.io.StreamSource,
     ) !void {
 
@@ -513,7 +526,7 @@ const RawGpt = struct {
     /// Returns a RawGpt on success, error.InvalidGpt if any of the verifications fail, or any
     /// other error if an allocation/seek/read failure occurs.
     pub fn read(
-        allocator: *std.mem.Allocator,
+        allocator: std.mem.Allocator,
         device: DeviceParam,
         stream: *std.io.StreamSource,
         header_lba: u64,
@@ -622,7 +635,7 @@ fn readFullOrError(
 /// Converts a UCS2 string (made of simple u16 Unicode codepoints), with each u16 encoded in little
 /// endian, into an allocated UTF-8 string
 fn ucs2LeToUtf8Alloc(
-    allocator: *std.mem.Allocator,
+    allocator: std.mem.Allocator,
     string: []const u16,
 ) ![]u8 {
     var list = std.ArrayList(u8).init(allocator);
